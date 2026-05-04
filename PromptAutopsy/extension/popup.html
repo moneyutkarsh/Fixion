@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="UTF-8">
+    <title>Fixion AI</title>
+    <style>
+      body {
+        width: 320px;
+        font-family: 'Inter', sans-serif, system-ui;
+        padding: 16px;
+        margin: 0;
+        background-color: #f9fafb;
+        color: #111827;
+      }
+      h3 {
+        margin-top: 0;
+        margin-bottom: 12px;
+        font-size: 18px;
+        color: #111827;
+      }
+      button {
+        width: 100%;
+        padding: 10px;
+        background-color: #4f46e5;
+        color: white;
+        border: none;
+        border-radius: 6px;
+        font-size: 14px;
+        font-weight: 600;
+        cursor: pointer;
+        transition: background-color 0.2s;
+      }
+      button:hover {
+        background-color: #4338ca;
+      }
+      #result {
+        margin-top: 16px;
+        font-size: 13px;
+        color: #4b5563;
+      }
+    </style>
+  </head>
+  <body>
+    <div style="display: flex; align-items: center; margin-bottom: 16px;">
+      <img src="icon.svg" alt="Fixion AI" style="width: 28px; height: 28px; margin-right: 12px; filter: drop-shadow(0 2px 4px rgba(59, 130, 246, 0.3));">
+      <div>
+        <h3 style="margin: 0; font-size: 16px; font-weight: 800; color: #111827;">Fixion AI</h3>
+        <div style="font-size: 10px; color: #6b7280; font-weight: 600; letter-spacing: 0.5px;">AI RELIABILITY ENGINE</div>
+      </div>
+    </div>
+    <button id="analyzeBtn">Analyze Current Page</button>
+    <div id="result"></div>
+    <script src="popup.js"></script>
+  </body>
+</html>

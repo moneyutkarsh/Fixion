@@ -1,0 +1,6 @@
+fastapi
+uvicorn[standard]
+duckduckgo-search
+trafilatura
+transformers
+torch
