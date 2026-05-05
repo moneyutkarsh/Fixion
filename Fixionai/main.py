@@ -4,7 +4,8 @@ from pydantic import BaseModel
 import re
 from duckduckgo_search import DDGS
 from trafilatura import fetch_url, extract
-from transformers import pipeline
+from hallucination_auditor import HallucinationAuditor
+from root_cause_engine import RootCauseEngine
 import json
 import urllib.request
 import time
@@ -53,10 +54,11 @@ async def get_test_cases():
     ]
 
 # Load NLI model globally
-nli_pipeline = pipeline("text-classification", model="MoritzLaurer/DeBERTa-v3-base-mnli-fever-anli")
+auditor = HallucinationAuditor()
+root_engine = RootCauseEngine(auditor)
+
 def extract_claims(text: str):
-    sentences = [s.strip() for s in re.split(r'[.!?]', text) if s.strip()]
-    claims = [s for s in sentences if len(s.split()) >= 5]
+    claims = auditor.extract_claims(text)
     logger.info(f"[CLAIMS] Extracted {len(claims)} claims")
     return claims
 
@@ -120,55 +122,29 @@ def compute_nli_status(claim: str, evidence_list: list):
     if not top_texts:
         return "neutral", 0.0, "retrieval_failure", "", 0.0, 0
         
-    labels = []
+    result = auditor.verify_claim(claim, top_texts)
     
-    for text in top_texts:
-        # text is the premise, claim is the hypothesis
-        result = nli_pipeline(claim, text)
-        if isinstance(result, list):
-            result = result[0]
-        label = result['label'].lower()
-        score = result['score']
-        labels.append((label, score, text))
-        
-    entailments = [x for x in labels if x[0] == "entailment"]
-    contradictions = [x for x in labels if x[0] == "contradiction"]
-    neutrals = [x for x in labels if x[0] == "neutral"]
+    status = result["status"]
+    severity = result.get("severity", "NONE")
+    confidence = result["confidence"]
+    best_text = result.get("matched_doc_snippet") or top_texts[0]
     
-    sources_checked = len(labels)
-    agreement_score = len(entailments) / sources_checked if sources_checked > 0 else 0.0
-    
-    # Decision logic
-    if len(contradictions) >= 1:
-        best_label = "contradiction"
-        root_cause = "llm_hallucination"
-        best_text = contradictions[0][2]
-        best_confidence = contradictions[0][1]
-    elif len(entailments) >= 2:
+    # Map HallucinationAuditor status to the UI's expected format
+    if status == "SUPPORTED":
         best_label = "entailment"
         root_cause = None
-        best_text = entailments[0][2]
-        best_confidence = entailments[0][1]
-    elif len(neutrals) == sources_checked:
+        agreement_score = 1.0
+    elif status == "PARTIAL":
         best_label = "neutral"
-        root_cause = "uncertain"
-        best_text = neutrals[0][2]
-        best_confidence = neutrals[0][1]
-    elif len(entailments) == 1:
-        # Fallback if only 1 entailment and no contradictions (e.g. 1 entailment, 2 neutral)
-        best_label = "entailment"
         root_cause = "weak_agreement"
-        best_text = entailments[0][2]
-        best_confidence = entailments[0][1]
+        agreement_score = 0.5
     else:
-        # Fallback
-        best_label = "neutral"
-        root_cause = "mixed_evidence"
-        best_text = labels[0][2]
-        best_confidence = labels[0][1]
+        best_label = "contradiction"
+        root_cause = "llm_fabrication" if severity == "HIGH" else "llm_hallucination"
+        agreement_score = 0.0
         
-    logger.info(f"[NLI] {best_label} ({round(best_confidence, 2)}) - Agreement: {round(agreement_score, 2)}")
-    return best_label, best_confidence, root_cause, best_text, agreement_score, sources_checked
+    logger.info(f"[AUDITOR] {best_label} ({round(confidence, 2)}) - Agreement: {round(agreement_score, 2)}")
+    return best_label, confidence, root_cause, best_text, agreement_score, len(top_texts)
 
 def generate_corrected_response(query: str, verified_context: list):
     context_str = "\n\n".join(verified_context)
@@ -196,6 +172,7 @@ class AnalyzeRequest(BaseModel):
     query: str
     response: str
     demo_mode: bool = False
+    custom_context: str = ""
 
 @app.post("/analyze")
 async def analyze(request: AnalyzeRequest):
@@ -279,6 +256,7 @@ async def analyze(request: AnalyzeRequest):
         cause_counts = {}
         verified_context = []
         nli_node_ids = []
+        all_docs = []
         
         for idx, claim in enumerate(claims):
             retrieval_id = f"retrieval_{idx}"
@@ -286,8 +264,13 @@ async def analyze(request: AnalyzeRequest):
             nli_id = f"nli_{idx}"
             
             t0_search = time.time()
-            ev = get_evidence(claim)
-            search_time_total += (time.time() - t0_search)
+            if request.custom_context:
+                # Enterprise Mode: Skip web search
+                ev = [{"title": "Enterprise Document", "url": "Internal Custom Context", "extracted_text": request.custom_context}]
+                search_time_total += 0.01
+            else:
+                ev = get_evidence(claim)
+                search_time_total += (time.time() - t0_search)
             
             retrieval_status = "success" if ev else "warning"
             
@@ -312,6 +295,8 @@ async def analyze(request: AnalyzeRequest):
             sources = []
             for e in ev[:3]:
                 text = e.get("extracted_text", "")
+                if text and text not in all_docs:
+                    all_docs.append(text)
                 if len(text) > 150:
                     text = text[:147] + "..."
                 sources.append({
@@ -389,6 +374,23 @@ async def analyze(request: AnalyzeRequest):
         else:
             explanation = "The response is well-supported by reliable sources."
 
+        # NEW ADVANCED PIPELINE (Phase 4 & 5)
+        root_cause_data = None
+        try:
+            full_report_json = auditor.evaluate_response(request.query, all_docs, request.response)
+            full_report = json.loads(full_report_json)
+            
+            root_cause_json = root_engine.analyze(request.query, all_docs, request.response, full_report)
+            root_cause_data = json.loads(root_cause_json)
+            
+            # Override traditional scoring with advanced metrics
+            faithfulness = full_report.get("faithfulness_score", faithfulness)
+            reliability_score = faithfulness
+            hallucination = 1.0 if full_report.get("hallucinated", False) else 0.0
+            explanation = root_cause_data.get("explanation", full_report.get("explanation", explanation))
+        except Exception as e:
+            logger.error(f"[ROOT CAUSE ENGINE ERROR] {e}")
+
         scoring = {
             "reliability_score": round(reliability_score, 2),
             "faithfulness": round(faithfulness, 2),
@@ -440,6 +442,7 @@ async def analyze(request: AnalyzeRequest):
             "claims": claims,
             "nli_results": nli_results,
             "root_cause_distribution": distribution,
+            "root_cause_analysis": root_cause_data,
             "scoring": scoring,
             "latency": latency,
             "trace": {

@@ -59,28 +59,45 @@ const COLORS = {
 };
 
 function scanForResponses() {
-    const elements = document.querySelectorAll('p, div, article, section');
     let bestEl = null;
-    let bestScore = -1;
 
-    for (let el of elements) {
-        // Skip elements that contain other block-level children (they are containers)
-        const hasBlockChildren = el.querySelector('div, article, section, ul, ol');
-        if (hasBlockChildren) continue;
+    // 1. Try to find standard AI chat response containers (ChatGPT, Claude, etc.)
+    const aiContainers = Array.from(document.querySelectorAll('.markdown, .prose, [data-message-author-role="assistant"]'));
+    
+    if (aiContainers.length > 0) {
+        // Take the last one that actually has text (most recent message)
+        for (let i = aiContainers.length - 1; i >= 0; i--) {
+            let el = aiContainers[i];
+            const text = (el.innerText || "").trim();
+            if (text.length > 20) {
+                bestEl = el;
+                break;
+            }
+        }
+    } else {
+        // 2. Fallback for general web pages
+        const elements = document.querySelectorAll('p, article, section, blockquote, li');
+        let bestScore = -1;
 
-        const text = (el.innerText || "").trim();
-        if (text.length < 100) continue;
+        for (let i = 0; i < elements.length; i++) {
+            let el = elements[i];
+            // Skip elements that contain other block-level children
+            const hasBlockChildren = el.querySelector('p, article, section, blockquote, ul, ol');
+            if (hasBlockChildren) continue;
 
-        // Score by sentence density: count periods, exclamation marks, question marks
-        const punctCount = (text.match(/[.!?]/g) || []).length;
-        const wordCount = text.split(/\s+/).length;
+            const text = (el.innerText || "").trim();
+            if (text.length < 20) continue;
 
-        // Good AI response: has sentences (punctuation), reasonable length, not too short
-        const score = punctCount * 10 + Math.min(wordCount, 150);
+            const punctCount = (text.match(/[.!?]/g) || []).length;
+            const wordCount = text.split(/\s+/).length;
 
-        if (score > bestScore) {
-            bestScore = score;
-            bestEl = el;
+            // Score by sentence density + length + position (prefer later elements)
+            const score = punctCount * 10 + Math.min(wordCount, 150) + (i * 0.5);
+
+            if (score > bestScore) {
+                bestScore = score;
+                bestEl = el;
+            }
         }
     }
 
@@ -91,7 +108,9 @@ function scanForResponses() {
             originalHTML = bestEl.innerHTML;
         }
         latestResponse = (bestEl.innerText || "").trim();
-        console.log("[Fixion AI] Selected text block. Score:", bestScore, "Length:", latestResponse.length);
+        console.log("[Fixion AI] Selected text block. Length:", latestResponse.length);
+    } else {
+        latestResponse = "";
     }
 }
 
@@ -106,12 +125,29 @@ function highlightClaims(nli_results) {
     latestElement.innerHTML = originalHTML;
     let html = latestElement.innerHTML;
     
-    const unsupported = nli_results.filter(r => r.status !== "entailment").map(r => r.claim);
-    unsupported.forEach(claim => {
-        const escaped = claim.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    // Sort so longer claims are replaced first to avoid partial matches
+    const sortedResults = [...nli_results].sort((a, b) => b.claim.length - a.claim.length);
+    
+    let citationCount = 1;
+    
+    sortedResults.forEach(r => {
+        const escaped = r.claim.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
         const regex = new RegExp(`(${escaped})`, 'g');
-        html = html.replace(regex, `<span title="Potential hallucination" style="background-color: rgba(254, 202, 202, 0.4); border-bottom: 2px dashed ${COLORS.danger}; border-radius: 3px; cursor: help; transition: all 0.2s;">$1</span>`);
+        
+        if (r.status === "entailment") {
+            // Supported: Add citation
+            if (r.sources && r.sources.length > 0) {
+                const url = r.sources[0].url;
+                html = html.replace(regex, `$1 <a href="${url}" target="_blank" style="display: inline-flex; align-items: center; justify-content: center; width: 14px; height: 14px; background: ${COLORS.success}; color: white; border-radius: 50%; font-size: 9px; font-weight: bold; text-decoration: none; vertical-align: super; line-height: 1; margin-left: 2px; box-shadow: 0 1px 3px rgba(0,0,0,0.2);" title="${url}">${citationCount}</a>`);
+                citationCount++;
+            }
+        } else {
+            // Unsupported: highlight red
+            let severityBorder = r.root_cause === "llm_fabrication" ? "2px solid" : "2px dashed";
+            html = html.replace(regex, `<span title="Hallucination detected" style="background-color: rgba(254, 202, 202, 0.4); border-bottom: ${severityBorder} ${COLORS.danger}; border-radius: 3px; cursor: help; transition: all 0.2s;">$1</span>`);
+        }
     });
+    
     latestElement.innerHTML = html;
 }
 
@@ -176,6 +212,14 @@ function createOverlayPanel() {
     `;
 
     panel.appendChild(header);
+
+    const enterpriseBox = document.createElement("div");
+    enterpriseBox.style.cssText = `padding: 12px; border-bottom: 1px solid var(--border); background: var(--bg);`;
+    enterpriseBox.innerHTML = `
+        <div style="font-size: 10px; font-weight: 800; color: ${COLORS.primary}; margin-bottom: 6px; letter-spacing: 0.5px;">ENTERPRISE MODE</div>
+        <textarea id="fx-custom-context" placeholder="Paste custom knowledge base/docs here to skip web search..." style="width: 100%; height: 50px; border: 1px solid var(--border); border-radius: 6px; padding: 8px; font-size: 12px; font-family: inherit; background: var(--card); color: var(--text); resize: none; outline: none;"></textarea>
+    `;
+    panel.appendChild(enterpriseBox);
 
     const content = document.createElement("div");
     content.id = "fixion-ai-content";
@@ -574,23 +618,33 @@ function openComparison(correction) {
     
     document.getElementById("fx-replace-btn-cta").onclick = () => {
         if (latestElement) {
-            latestElement.innerText = correction.corrected_response;
-            latestElement.style.border = `2px solid ${COLORS.success}`;
-            latestElement.style.padding = "16px";
-            latestElement.style.borderRadius = "12px";
-            latestElement.style.backgroundColor = "#ecfdf5";
-            latestElement.style.transition = "all 0.5s ease";
-            
-            const badge = document.createElement("div");
-            badge.innerHTML = "✨ Verified by Fixion AI";
-            badge.style.cssText = `
-                display: inline-block; margin-bottom: 10px; padding: 4px 10px; 
-                background: ${COLORS.success}; color: white; border-radius: 20px; 
-                font-size: 12px; font-weight: bold; font-family: sans-serif;
-            `;
-            latestElement.insertBefore(badge, latestElement.firstChild);
-            
             document.getElementById("fx-close-compare").click();
+            
+            // Self-Healing Animation
+            latestElement.style.transition = "all 0.4s ease";
+            latestElement.style.opacity = "0.2";
+            latestElement.style.transform = "scale(0.98)";
+            
+            setTimeout(() => {
+                latestElement.innerText = correction.corrected_response;
+                latestElement.style.border = `2px solid ${COLORS.success}`;
+                latestElement.style.padding = "16px";
+                latestElement.style.borderRadius = "12px";
+                latestElement.style.backgroundColor = "rgba(16, 185, 129, 0.05)";
+                latestElement.style.opacity = "1";
+                latestElement.style.transform = "scale(1)";
+                latestElement.style.boxShadow = "0 0 20px rgba(16, 185, 129, 0.2)";
+                
+                const badge = document.createElement("div");
+                badge.innerHTML = "✨ Auto-Healed by Fixion AI";
+                badge.style.cssText = `
+                    display: inline-block; margin-bottom: 12px; padding: 6px 12px; 
+                    background: ${COLORS.success}; color: white; border-radius: 20px; 
+                    font-size: 12px; font-weight: 800; font-family: sans-serif;
+                    box-shadow: 0 4px 10px rgba(16,185,129,0.3); letter-spacing: 0.5px;
+                `;
+                latestElement.insertBefore(badge, latestElement.firstChild);
+            }, 400);
         }
     };
     
@@ -643,11 +697,12 @@ async function analyzeResponse(text, btn) {
     try {
         // Turn off demo mode so real live AI inference runs
         const USE_DEMO_MODE = false; 
+        const customContext = document.getElementById("fx-custom-context")?.value || "";
         
         const response = await fetch("http://127.0.0.1:8000/analyze", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ query: "unknown", response: text, demo_mode: USE_DEMO_MODE })
+            body: JSON.stringify({ query: "unknown", response: text, demo_mode: USE_DEMO_MODE, custom_context: customContext })
         });
 
         if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
@@ -690,14 +745,29 @@ async function analyzeResponse(text, btn) {
         }
         
         const content = document.getElementById("fixion-ai-content");
-        if(content) content.innerHTML = `
-            <div style="text-align: center; padding: 20px;">
-                <div style="font-size: 32px; margin-bottom: 12px;">🔌</div>
-                <div style="color: ${COLORS.danger}; font-weight: bold; margin-bottom: 8px;">Connection Failed</div>
-                <div style="color: ${COLORS.textMuted}; font-size: 13px;">Ensure your FastAPI backend is running on port 8000.</div>
-                <button onclick="document.getElementById('fx-close-panel').click()" style="margin-top: 16px; padding: 8px 16px; background: ${COLORS.bgGray}; border: 1px solid #d1d5db; border-radius: 6px; cursor: pointer; color: ${COLORS.textDark}; font-weight: bold;">Retry</button>
-            </div>
-        `;
+        if(content) {
+            content.innerHTML = `
+                <div style="text-align: center; padding: 20px;">
+                    <div style="font-size: 32px; margin-bottom: 12px;">🔌</div>
+                    <div style="color: ${COLORS.danger}; font-weight: bold; margin-bottom: 8px;">Connection Failed</div>
+                    <div style="color: ${COLORS.textMuted}; font-size: 13px;">Ensure your FastAPI backend is running on port 8000.</div>
+                    <button id="fx-retry-btn" style="margin-top: 16px; padding: 8px 16px; background: ${COLORS.bgGray}; border: 1px solid #d1d5db; border-radius: 6px; cursor: pointer; color: ${COLORS.textDark}; font-weight: bold;">Retry</button>
+                </div>
+            `;
+            
+            // Wait for DOM update
+            setTimeout(() => {
+                const retryBtn = document.getElementById("fx-retry-btn");
+                if (retryBtn) {
+                    retryBtn.addEventListener("click", () => {
+                        const closeBtn = document.getElementById("fx-close-panel");
+                        if (closeBtn) closeBtn.click();
+                        // Also auto-click the original button to retry immediately!
+                        if (btn) btn.click();
+                    });
+                }
+            }, 0);
+        }
         throw error;
     } finally {
         if (btn) {
