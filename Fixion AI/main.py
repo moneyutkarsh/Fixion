@@ -2,7 +2,7 @@ from fastapi import FastAPI
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 import re
-from duckduckgo_search import DDGS
+from ddgs import DDGS
 from trafilatura import fetch_url, extract
 from transformers import pipeline
 import json
@@ -85,90 +85,148 @@ def get_evidence(claim: str):
     for r in results:
         if len(evidence_list) >= 3:
             break
-            
+
         title = r.get("title", "")
         url = r.get("href", "")
         extracted_text = ""
+
+        logger.info(f"[DEBUG] Trying URL: {url}")
+
         try:
-            downloaded = fetch_url(url, timeout=10)
-            if downloaded:
-                text = extract(downloaded, include_comments=False, include_links=False, output='text')
-                if text:
-                    extracted_text = text.strip()
-                    if len(extracted_text) < 200:
-                        logger.info(f"[CONTENT] Skipping {url}, only {len(extracted_text)} chars (too short)")
-                        continue
-                    extracted_text = extracted_text[:1000].strip()
-                    logger.info(f"[CONTENT] Extracted {len(extracted_text)} chars from {url}")
+            downloaded = fetch_url(url)
+
+            if not downloaded:
+                logger.info(f"[DEBUG] fetch_url FAILED for {url}")
+                continue
+
+            logger.info(f"[DEBUG] fetch_url SUCCESS for {url}")
+
+            text = extract(
+                downloaded,
+                include_comments=False,
+                include_links=False,
+            )
+
+            if not text:
+                logger.info(f"[DEBUG] trafilatura extract FAILED for {url}")
+                continue
+
+            extracted_text = text.strip()
+
+            logger.info(f"[DEBUG] Raw Extracted Length: {len(extracted_text)}")
+
+            if len(extracted_text) < 50:
+                logger.info(f"[CONTENT] Skipping short text from {url}")
+                continue
+
+            extracted_text = extracted_text[:1000]
+
+            evidence_list.append({
+                "title": title,
+                "url": url,
+                "extracted_text": extracted_text
+            })
+
+            logger.info(f"[SUCCESS] Added evidence from {url}")
+
         except Exception as e:
-            logger.info(f"[CONTENT] Extracted error for {url}: {e}")
-            pass
-            
-        if extracted_text:
-            evidence_list.append({"title": title, "url": url, "extracted_text": extracted_text})
-            
+            logger.info(f"[ERROR] {url}: {e}")
+
     return evidence_list
 
 def compute_nli_status(claim: str, evidence_list: list):
-    # If there is no evidence, consider claim neutral/unsupported
     if not evidence_list:
         return "neutral", 0.0, "retrieval_failure", "", 0.0, 0
-    
+
     top_texts = [ev["extracted_text"] for ev in evidence_list if ev.get("extracted_text")]
-    top_texts = top_texts[:3] # Compare with top 3 extracted texts
-    
+    top_texts = top_texts[:3]
+
     if not top_texts:
         return "neutral", 0.0, "retrieval_failure", "", 0.0, 0
-        
+
     labels = []
-    
+
+
+    LABEL_MAP = {
+        "LABEL_0": "contradiction",
+        "LABEL_1": "neutral",
+        "LABEL_2": "entailment"
+    }
+
     for text in top_texts:
-        # text is the premise, claim is the hypothesis
-        result = nli_pipeline(claim, text)
+        result = nli_pipeline(
+            f"{text} [SEP] {claim}"
+        )
+        
+        print("NLI RESULT:", result)  
+
         if isinstance(result, list):
             result = result[0]
-        label = result['label'].lower()
-        score = result['score']
+        
+        raw_label = result["label"]
+
+
+        label = LABEL_MAP.get(raw_label, raw_label).lower()
+        score = result["score"]
+
         labels.append((label, score, text))
-        
-    entailments = [x for x in labels if x[0] == "entailment"]
-    contradictions = [x for x in labels if x[0] == "contradiction"]
-    neutrals = [x for x in labels if x[0] == "neutral"]
-    
+
+    entailments = [x for x in labels if "entail" in x[0]]
+    contradictions = [x for x in labels if "contrad" in x[0]]
+    neutrals = [x for x in labels if "neutral" in x[0]]
+
     sources_checked = len(labels)
-    agreement_score = len(entailments) / sources_checked if sources_checked > 0 else 0.0
-    
-    # Decision logic
-    if len(contradictions) >= 1:
-        best_label = "contradiction"
-        root_cause = "llm_hallucination"
-        best_text = contradictions[0][2]
-        best_confidence = contradictions[0][1]
-    elif len(entailments) >= 2:
-        best_label = "entailment"
-        root_cause = None
-        best_text = entailments[0][2]
-        best_confidence = entailments[0][1]
-    elif len(neutrals) == sources_checked:
-        best_label = "neutral"
-        root_cause = "uncertain"
-        best_text = neutrals[0][2]
-        best_confidence = neutrals[0][1]
-    elif len(entailments) == 1:
-        # Fallback if only 1 entailment and no contradictions (e.g. 1 entailment, 2 neutral)
-        best_label = "entailment"
-        root_cause = "weak_agreement"
-        best_text = entailments[0][2]
-        best_confidence = entailments[0][1]
-    else:
-        # Fallback
-        best_label = "neutral"
-        root_cause = "mixed_evidence"
-        best_text = labels[0][2]
-        best_confidence = labels[0][1]
-        
-    logger.info(f"[NLI] {best_label} ({round(best_confidence, 2)}) - Agreement: {round(agreement_score, 2)}")
-    return best_label, best_confidence, root_cause, best_text, agreement_score, sources_checked
+    agreement_score = len(entailments) / sources_checked if sources_checked else 0.0
+
+    # ROOT CAUSE DIAGNOSIS LOGIC
+    if contradictions:
+        return (
+            "contradiction",
+            contradictions[0][1],
+            "llm_hallucination",
+            contradictions[0][2],
+            agreement_score,
+            sources_checked
+        )
+
+    if len(entailments) >= 2:
+        return (
+            "entailment",
+            entailments[0][1],
+            None,
+            entailments[0][2],
+            agreement_score,
+            sources_checked
+        )
+
+    if len(entailments) == 1 and len(neutrals) >= 1:
+        return (
+            "neutral",
+            entailments[0][1],
+            "weak_grounding",
+            entailments[0][2],
+            agreement_score,
+            sources_checked
+        )
+
+    if len(neutrals) == sources_checked:
+        return (
+            "neutral",
+            neutrals[0][1],
+            "insufficient_evidence",
+            neutrals[0][2],
+            agreement_score,
+            sources_checked
+        )
+
+    return (
+        "neutral",
+        0.0,
+        "mixed_evidence",
+        "",
+        agreement_score,
+        sources_checked
+    )
 
 def generate_corrected_response(query: str, verified_context: list):
     context_str = "\n\n".join(verified_context)
@@ -280,18 +338,28 @@ async def analyze(request: AnalyzeRequest):
         verified_context = []
         nli_node_ids = []
         
+        # -----------------------------
+        # GLOBAL RETRIEVAL (RUN ONCE)
+        # -----------------------------
+       
+
+        t0_search = time.time()
+        query = request.query
+        ev = get_evidence(query)
+        search_time_total += (time.time() - t0_search) # already measured inside get_evidence if needed
+
+        # -----------------------------
+        # PROCESS EACH CLAIM
+        # -----------------------------
         for idx, claim in enumerate(claims):
+
             retrieval_id = f"retrieval_{idx}"
             evidence_id = f"evidence_{idx}"
             nli_id = f"nli_{idx}"
-            
-            t0_search = time.time()
-            ev = get_evidence(claim)
-            search_time_total += (time.time() - t0_search)
-            
+
             retrieval_status = "success" if ev else "warning"
             
-            add_node(retrieval_id, "retrieval", claim, "Web search executed", f"Web Retrieval {idx+1}", status=retrieval_status)
+            add_node(retrieval_id, "retrieval", query, "Web search executed", f"Web Retrieval {idx+1}", status=retrieval_status)
             add_edge("node_claims", retrieval_id)
             yield f"data: {json.dumps({'step': 'retrieval_done', 'status': retrieval_status, 'data': {'claim': claim}})}\n\n"
             
@@ -310,14 +378,18 @@ async def analyze(request: AnalyzeRequest):
                 verified_context.append(best_text)
                 
             sources = []
-            for e in ev[:3]:
-                text = e.get("extracted_text", "")
-                if len(text) > 150:
-                    text = text[:147] + "..."
-                sources.append({
-                    "url": e.get("url", ""),
-                    "snippet": text
-                })
+
+            if ev:
+                for e in ev[:3]:
+                    text = e.get("extracted_text", "")
+
+                    if len(text) > 150:
+                        text = text[:147] + "..."
+
+                    sources.append({
+                        "url": e.get("url", ""),
+                        "snippet": text
+                    })
 
             nli_result = {
                 "claim": claim,
