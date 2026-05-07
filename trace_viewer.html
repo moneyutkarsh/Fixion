@@ -1,0 +1,298 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Fixion AI - Trace Graph</title>
+    <!-- Use D3 v5 for better compatibility with dagre-d3 -->
+    <script src="https://d3js.org/d3.v5.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/dagre-d3/0.6.4/dagre-d3.min.js"></script>
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #f3f4f6; margin: 0; padding: 20px; color: #111827; }
+        h2 { margin-top: 0; color: #1f2937; }
+        
+        .container { max-width: 1200px; margin: 0 auto; }
+        
+        #graph-container { 
+            background: white; 
+            border-radius: 12px; 
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06); 
+            padding: 20px; 
+            overflow: hidden; 
+            margin-top: 20px;
+        }
+        
+        svg { width: 100%; height: 75vh; }
+        
+        /* Node Styling */
+        .node rect { stroke: #374151; stroke-width: 2px; rx: 8px; ry: 8px; cursor: pointer; transition: stroke-width 0.1s;}
+        .node.success rect { fill: #d1fae5; stroke: #059669; }
+        .node.warning rect { fill: #fef3c7; stroke: #d97706; }
+        .node.failure rect { fill: #fee2e2; stroke: #dc2626; }
+        
+        .node text { font-weight: bold; font-size: 13px; fill: #111827; pointer-events: none; font-family: sans-serif; }
+        
+        /* Edge Styling */
+        .edgePath path { stroke: #9ca3af; stroke-width: 2px; fill: none; transition: stroke-width 0.2s; }
+        .edgePath marker { fill: #9ca3af; }
+        
+        .edgePath.failure-edge path { stroke: #ef4444; stroke-width: 4px; filter: drop-shadow(0 0 5px rgba(239,68,68,0.6)); }
+        .edgePath.failure-edge marker { fill: #ef4444; }
+        
+        .edgePath.fix-edge path { stroke: #10b981; stroke-width: 4px; filter: drop-shadow(0 0 5px rgba(16,185,129,0.6)); stroke-dasharray: 8,4; animation: dash 1s linear infinite; }
+        .edgePath.fix-edge marker { fill: #10b981; }
+        
+        @keyframes dash {
+          to { stroke-dashoffset: -12; }
+        }
+        
+        .node.failure rect { fill: #fee2e2; stroke: #dc2626; filter: drop-shadow(0 0 8px rgba(239,68,68,0.7)); }
+        .node.correction.success rect { fill: #d1fae5; stroke: #059669; filter: drop-shadow(0 0 8px rgba(16,185,129,0.7)); }
+        
+        /* Tooltip */
+        #tooltip {
+            position: absolute;
+            opacity: 0;
+            background: #1f2937;
+            color: #f9fafb;
+            padding: 16px;
+            border-radius: 8px;
+            font-size: 13px;
+            pointer-events: none;
+            max-width: 350px;
+            box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.5);
+            transition: opacity 0.15s;
+            z-index: 1000;
+            word-wrap: break-word;
+        }
+        
+        /* Input Controls */
+        .controls { display: flex; flex-direction: column; gap: 10px; background: white; padding: 20px; border-radius: 12px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+        #data-input {
+            width: 100%;
+            height: 100px;
+            font-family: monospace;
+            border: 1px solid #d1d5db;
+            border-radius: 6px;
+            padding: 10px;
+            box-sizing: border-box;
+            resize: vertical;
+        }
+        button {
+            padding: 10px 24px; 
+            background: #4f46e5; 
+            color: white; 
+            border: none; 
+            border-radius: 6px; 
+            cursor: pointer;
+            font-weight: 600;
+            font-size: 14px;
+            align-self: flex-start;
+            transition: background 0.2s;
+        }
+        button:hover { background: #4338ca; }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <h2>Fixion AI Trace Graph</h2>
+    
+    <div class="controls">
+        <textarea id="data-input" placeholder="Paste the JSON response from the /analyze endpoint here to visualize the DAG..."></textarea>
+        <button onclick="renderGraph()">Render Graph</button>
+    </div>
+
+    <div id="graph-summary" style="margin-top: 20px;"></div>
+
+    <div id="graph-container">
+        <svg><g id="inner-svg"></g></svg>
+    </div>
+</div>
+
+<div id="tooltip"></div>
+
+<script>
+    function renderGraph() {
+        const rawData = document.getElementById("data-input").value;
+        if (!rawData) return;
+        
+        let data;
+        try {
+            const parsed = JSON.parse(rawData);
+            // Support either the full API response or just the trace object
+            data = parsed.trace ? parsed.trace : parsed;
+        } catch (e) {
+            alert("Invalid JSON. Please paste a valid JSON object.");
+            return;
+        }
+
+        if (!data.nodes || !data.edges) {
+            alert("JSON must contain 'nodes' and 'edges' arrays.");
+            return;
+        }
+
+        // Initialize Dagre D3 Graph
+        const g = new dagreD3.graphlib.Graph()
+            .setGraph({ rankdir: 'LR', marginx: 40, marginy: 40, ranksep: 80, nodesep: 50 })
+            .setDefaultEdgeLabel(() => ({}));
+
+        // Render Nodes
+        data.nodes.forEach(node => {
+            let className = "node ";
+            if (node.type === "correction") className += "correction ";
+            
+            if (node.status === "success") className += "success";
+            else if (node.status === "warning") className += "warning";
+            else if (node.status === "failure") className += "failure";
+            else className += "success"; // Default
+
+            g.setNode(node.id, { 
+                label: node.label || node.type,
+                class: className,
+                nodeData: node, // Attach raw node data for the tooltip
+                padding: 12,
+                rx: 5,
+                ry: 5
+            });
+        });
+
+        // Path Highlighting Logic
+        const reverseEdges = {};
+        data.nodes.forEach(n => reverseEdges[n.id] = []);
+        data.edges.forEach(e => {
+            if(!reverseEdges[e.to]) reverseEdges[e.to] = [];
+            reverseEdges[e.to].push(e.from);
+        });
+
+        const failureNodes = data.nodes.filter(n => n.status === "failure");
+        const failureEdges = new Set();
+        const visitedFailures = new Set();
+
+        failureNodes.forEach(fn => {
+            let queue = [fn.id];
+            while(queue.length > 0) {
+                let curr = queue.shift();
+                if(visitedFailures.has(curr)) continue;
+                visitedFailures.add(curr);
+                
+                const parents = reverseEdges[curr] || [];
+                parents.forEach(p => {
+                    failureEdges.add(`${p}->${curr}`);
+                    queue.push(p);
+                });
+            }
+        });
+
+        const fixNodes = data.nodes.filter(n => n.type === "correction");
+        const fixEdges = new Set();
+
+        fixNodes.forEach(fn => {
+            const parents = reverseEdges[fn.id] || [];
+            parents.forEach(p => {
+                fixEdges.add(`${p}->${fn.id}`);
+            });
+        });
+
+        // Summary Text
+        const summaryDiv = document.getElementById("graph-summary");
+        let summaryHtml = "";
+        
+        if(failureNodes.length > 0) {
+            const labels = failureNodes.map(n => n.label).join(", ");
+            summaryHtml += `<div style="padding: 12px; background: #fee2e2; color: #991b1b; border-left: 4px solid #ef4444; margin-bottom: 10px; border-radius: 4px;"><strong>⚠️ Failure occurred at:</strong> ${labels}. The graph highlights the breakdown path in red.</div>`;
+        } else if (data.nodes.some(n => n.status === "warning")) {
+            summaryHtml += `<div style="padding: 12px; background: #fef3c7; color: #92400e; border-left: 4px solid #f59e0b; margin-bottom: 10px; border-radius: 4px;"><strong>⚠️ Warnings detected.</strong> Check yellow nodes for details.</div>`;
+        } else {
+            summaryHtml += `<div style="padding: 12px; background: #d1fae5; color: #065f46; border-left: 4px solid #10b981; margin-bottom: 10px; border-radius: 4px;"><strong>✅ All checks passed!</strong> The trace is fully successful.</div>`;
+        }
+
+        if(fixNodes.length > 0 && fixNodes[0].status === "success") {
+            summaryHtml += `<div style="padding: 12px; background: #d1fae5; color: #065f46; border-left: 4px solid #10b981; margin-bottom: 10px; border-radius: 4px;"><strong>✨ Fix Applied:</strong> A self-healing correction was generated successfully. The fix path is highlighted in green.</div>`;
+        }
+        summaryDiv.innerHTML = summaryHtml;
+
+        // Render Edges
+        data.edges.forEach(edge => {
+            let edgeClass = "";
+            if (failureEdges.has(`${edge.from}->${edge.to}`)) edgeClass = "failure-edge";
+            if (fixEdges.has(`${edge.from}->${edge.to}`)) edgeClass = "fix-edge";
+            
+            g.setEdge(edge.from, edge.to, {
+                curve: d3.curveBasis,
+                class: edgeClass
+            });
+        });
+
+        const svg = d3.select("svg");
+        const inner = d3.select("#inner-svg");
+        
+        // Clear previous render
+        inner.selectAll("*").remove();
+
+        // Setup Zoom
+        const zoom = d3.zoom().on("zoom", () => {
+            inner.attr("transform", d3.event.transform);
+        });
+        svg.call(zoom);
+
+        // Run Renderer
+        const render = new dagreD3.render();
+        render(inner, g);
+        
+        // Center the graph vertically and align left
+        const svgNode = svg.node();
+        const width = svgNode.getBoundingClientRect().width;
+        const height = svgNode.getBoundingClientRect().height;
+        const gHeight = g.graph().height;
+        
+        const yCenterOffset = (height - gHeight) / 2;
+        const transform = d3.zoomIdentity.translate(20, Math.max(20, yCenterOffset));
+        svg.call(zoom.transform, transform);
+
+        // Hover Tooltip Interactions
+        const tooltip = d3.select("#tooltip");
+        
+        inner.selectAll("g.node")
+            .on("mouseover", function(id) {
+                const node = g.node(id).nodeData;
+                
+                let content = `<div style="font-size:15px;font-weight:bold;margin-bottom:4px;">${node.label}</div>`;
+                content += `<div style="color:#9ca3af;margin-bottom:8px;">Status: <span style="color:white">${node.status.toUpperCase()}</span></div>`;
+                
+                if (node.score !== undefined && node.score !== null) {
+                    content += `<div style="color:#9ca3af;margin-bottom:8px;">Score: <span style="color:white">${node.score}</span></div>`;
+                }
+                
+                let inputStr = JSON.stringify(node.input, null, 2);
+                if (inputStr && inputStr.length > 150) inputStr = inputStr.substring(0, 150) + '...';
+                
+                let outputStr = JSON.stringify(node.output, null, 2);
+                if (outputStr && outputStr.length > 150) outputStr = outputStr.substring(0, 150) + '...';
+                
+                content += `<hr style="border:0;border-top:1px solid #4b5563;margin:10px 0;"/>`;
+                content += `<div style="color:#9ca3af;font-size:11px;margin-bottom:2px;">INPUT</div>`;
+                content += `<div style="font-family:monospace;background:#374151;padding:6px;border-radius:4px;margin-bottom:8px;">${inputStr}</div>`;
+                
+                content += `<div style="color:#9ca3af;font-size:11px;margin-bottom:2px;">OUTPUT</div>`;
+                content += `<div style="font-family:monospace;background:#374151;padding:6px;border-radius:4px;">${outputStr}</div>`;
+
+                tooltip.html(content)
+                    .style("opacity", 1)
+                    .style("left", (d3.event.pageX + 20) + "px")
+                    .style("top", (d3.event.pageY + 20) + "px");
+                    
+                d3.select(this).select("rect").style("stroke-width", "3px");
+            })
+            .on("mousemove", function() {
+                tooltip.style("left", (d3.event.pageX + 20) + "px")
+                       .style("top", (d3.event.pageY + 20) + "px");
+            })
+            .on("mouseout", function() {
+                tooltip.style("opacity", 0);
+                d3.select(this).select("rect").style("stroke-width", "2px");
+            });
+    }
+</script>
+</body>
+</html>
