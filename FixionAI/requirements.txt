@@ -4,3 +4,4 @@ duckduckgo-search
 trafilatura
 transformers
 torch
+python-dotenv

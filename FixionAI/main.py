@@ -1,17 +1,32 @@
 from fastapi import FastAPI
 from fastapi.responses import StreamingResponse
+from fastapi.staticfiles import StaticFiles
+
 from pydantic import BaseModel
 import re
-from ddgs import DDGS
+from duckduckgo_search import DDGS
 from trafilatura import fetch_url, extract
 from transformers import pipeline
 import json
 import urllib.request
 import time
+import os
 import logging
+from dotenv import load_dotenv
+
+load_dotenv()
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger("FixionAI")
+
+# ─── Configuration from .env ─────────────────────────────────────────────────
+NLI_MODEL_NAME = os.environ.get("NLI_MODEL", "MoritzLaurer/DeBERTa-v3-base-mnli-fever-anli")
+CORRECTION_MODEL = os.environ.get("CORRECTION_MODEL", "llama3")
+OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434/api/generate")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+BACKEND_HOST = os.environ.get("BACKEND_HOST", "127.0.0.1")
+BACKEND_PORT = int(os.environ.get("BACKEND_PORT", "8000"))
+DEBUG = os.environ.get("DEBUG", "False").lower() == "true"
 
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -24,6 +39,17 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Serve static files (like trace_viewer.html)
+app.mount("/static", StaticFiles(directory="."), name="static")
+# Optional: mount extension folder if needed
+app.mount("/extension", StaticFiles(directory="extension"), name="extension")
+
+@app.get("/trace_viewer.html")
+async def get_trace_viewer():
+    from fastapi.responses import FileResponse
+    return FileResponse("trace_viewer.html")
+
 
 @app.get("/health")
 async def health():
@@ -53,7 +79,67 @@ async def get_test_cases():
     ]
 
 # Load NLI model globally
-nli_pipeline = pipeline("text-classification", model="MoritzLaurer/DeBERTa-v3-base-mnli-fever-anli")
+nli_pipeline = pipeline("text-classification", model=NLI_MODEL_NAME)
+
+# ─── TASK 1: Stopwords + Claim-Aware Chunking ────────────────────────────────
+
+STOPWORDS = {
+    "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
+    "have", "has", "had", "do", "does", "did", "will", "would", "could",
+    "should", "may", "might", "shall", "can", "need", "dare", "ought",
+    "in", "on", "at", "to", "for", "of", "with", "by", "from", "as",
+    "into", "through", "during", "before", "after", "above", "below",
+    "between", "out", "off", "over", "under", "again", "further", "then",
+    "once", "and", "but", "or", "nor", "not", "so", "yet", "both",
+    "either", "neither", "each", "every", "all", "any", "few", "more",
+    "most", "other", "some", "such", "no", "only", "own", "same",
+    "than", "too", "very", "just", "because", "if", "when", "where",
+    "how", "what", "which", "who", "whom", "this", "that", "these",
+    "those", "it", "its", "he", "she", "they", "them", "we", "us",
+    "i", "me", "my", "your", "his", "her", "their", "our"
+}
+
+def extract_relevant_chunk(full_text: str, claim: str, window_size: int = 2, max_chars: int = 1000) -> str:
+    """Extract the most relevant chunk of text around the best-matching sentence for a claim."""
+    sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+', full_text) if s.strip()]
+
+    if not sentences:
+        return full_text[:max_chars]
+
+    claim_words = {w.lower() for w in re.findall(r'\w+', claim)} - STOPWORDS
+
+    if not claim_words:
+        return full_text[:max_chars]
+
+    best_idx = 0
+    best_score = -1
+
+    for idx, sent in enumerate(sentences):
+        sent_words = {w.lower() for w in re.findall(r'\w+', sent)} - STOPWORDS
+        if not sent_words:
+            continue
+        overlap = len(claim_words & sent_words)
+        score = overlap / len(claim_words)
+        if score > best_score:
+            best_score = score
+            best_idx = idx
+
+    if best_score < 0.15:
+        logger.info(f"[CHUNK] No good match (best={best_score:.2f}), using first {max_chars} chars")
+        return full_text[:max_chars]
+
+    start = max(0, best_idx - window_size)
+    end = min(len(sentences), best_idx + window_size + 1)
+    chunk = " ".join(sentences[start:end])
+
+    if len(chunk) > max_chars:
+        chunk = chunk[:max_chars]
+
+    logger.info(f"[CHUNK] Best match at sentence {best_idx} (score={best_score:.2f}), window [{start}:{end}]")
+    return chunk
+
+# ─── Core Functions ──────────────────────────────────────────────────────────
+
 def extract_claims(text: str):
     sentences = [s.strip() for s in re.split(r'[.!?]', text) if s.strip()]
     claims = [s for s in sentences if len(s.split()) >= 5]
@@ -119,12 +205,12 @@ def get_evidence(claim: str):
                 logger.info(f"[CONTENT] Skipping short text from {url}")
                 continue
 
-            extracted_text = extracted_text[:1000]
-
+            # Store full text for per-claim re-chunking, and a default truncation
             evidence_list.append({
                 "title": title,
                 "url": url,
-                "extracted_text": extracted_text
+                "full_text": extracted_text,
+                "extracted_text": extracted_text[:1000]
             })
 
             logger.info(f"[SUCCESS] Added evidence from {url}")
@@ -228,27 +314,108 @@ def compute_nli_status(claim: str, evidence_list: list):
         sources_checked
     )
 
-def generate_corrected_response(query: str, verified_context: list):
+# ─── TASK 3: Ollama Hardening + Gemini Fallback ─────────────────────────────
+
+def is_ollama_available() -> bool:
+    """Check if Ollama is running and responsive."""
+    try:
+        ollama_base = OLLAMA_URL.rsplit('/', 2)[0]  # extract base URL
+        req = urllib.request.Request(f"{ollama_base}/api/tags")
+        with urllib.request.urlopen(req, timeout=5) as response:
+            return response.status == 200
+    except Exception:
+        return False
+
+def generate_with_ollama(prompt: str, max_retries: int = 2) -> dict:
+    """Try to generate a response using Ollama with retry logic."""
+    if not is_ollama_available():
+        logger.info("[OLLAMA] Not available, skipping")
+        return {"text": "", "source": "ollama", "success": False}
+
+    url = OLLAMA_URL
+    data = {
+        "model": CORRECTION_MODEL,
+        "prompt": prompt,
+        "stream": False
+    }
+
+    for attempt in range(max_retries):
+        try:
+            req = urllib.request.Request(
+                url,
+                data=json.dumps(data).encode('utf-8'),
+                headers={'Content-Type': 'application/json'}
+            )
+            with urllib.request.urlopen(req, timeout=45) as response:
+                result = json.loads(response.read().decode('utf-8'))
+                text = result.get("response", "")
+                if text:
+                    logger.info(f"[OLLAMA] Success on attempt {attempt + 1}")
+                    return {"text": text, "source": "ollama", "success": True}
+        except Exception as e:
+            logger.info(f"[OLLAMA] Attempt {attempt + 1} failed: {e}")
+            if attempt < max_retries - 1:
+                time.sleep(2 * (attempt + 1))
+
+    return {"text": "", "source": "ollama", "success": False}
+
+def generate_with_gemini(prompt: str) -> dict:
+    """Fallback: generate a response using Gemini API via urllib."""
+    api_key = GEMINI_API_KEY
+    if not api_key:
+        logger.info("[GEMINI] No GEMINI_API_KEY set, skipping fallback")
+        return {"text": "", "source": "gemini", "success": False}
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={api_key}"
+    data = {
+        "contents": [{"parts": [{"text": prompt}]}]
+    }
+
+    try:
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(data).encode('utf-8'),
+            headers={'Content-Type': 'application/json'}
+        )
+        with urllib.request.urlopen(req, timeout=30) as response:
+            result = json.loads(response.read().decode('utf-8'))
+            text = result.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
+            if text:
+                logger.info("[GEMINI] Fallback success")
+                return {"text": text, "source": "gemini", "success": True}
+    except Exception as e:
+        logger.info(f"[GEMINI] Fallback failed: {e}")
+
+    return {"text": "", "source": "gemini", "success": False}
+
+def generate_corrected_response(query: str, verified_context: list) -> dict:
+    """Generate a corrected response using Ollama (primary) or Gemini (fallback)."""
     context_str = "\n\n".join(verified_context)
     if not context_str:
         context_str = "No verified context available."
         
-    prompt = f"Answer the query using ONLY verified context\n\nContext:\n{context_str}\n\nQuery:\n{query}"
-    
-    url = "http://localhost:11434/api/generate"
-    data = {
-        "model": "llama3",
-        "prompt": prompt,
-        "stream": False
+    prompt = f"Answer the query using ONLY verified context. Be concise and factual.\n\nContext:\n{context_str}\n\nQuery:\n{query}"
+
+    # Try Ollama first
+    result = generate_with_ollama(prompt)
+    if result["success"]:
+        return result
+
+    # Fallback to Gemini
+    logger.info("[CORRECTION] Ollama failed, trying Gemini fallback...")
+    result = generate_with_gemini(prompt)
+    if result["success"]:
+        return result
+
+    # Both failed
+    logger.info("[CORRECTION] All correction backends failed")
+    return {
+        "text": "Correction unavailable — both Ollama and Gemini backends failed.",
+        "source": "error",
+        "success": False
     }
-    
-    try:
-        req = urllib.request.Request(url, data=json.dumps(data).encode('utf-8'), headers={'Content-Type': 'application/json'})
-        with urllib.request.urlopen(req, timeout=45) as response:
-            result = json.loads(response.read().decode('utf-8'))
-            return result.get("response", "")
-    except Exception as e:
-        return f"Error contacting Ollama: {str(e)}"
+
+# ─── Request Model & Main Endpoint ──────────────────────────────────────────
 
 class AnalyzeRequest(BaseModel):
     query: str
@@ -346,7 +513,7 @@ async def analyze(request: AnalyzeRequest):
         t0_search = time.time()
         query = request.query
         ev = get_evidence(query)
-        search_time_total += (time.time() - t0_search) # already measured inside get_evidence if needed
+        search_time_total += (time.time() - t0_search)
 
         # -----------------------------
         # PROCESS EACH CLAIM
@@ -367,8 +534,18 @@ async def analyze(request: AnalyzeRequest):
             add_edge(retrieval_id, evidence_id)
             yield f"data: {json.dumps({'step': 'evidence_processed', 'status': retrieval_status, 'data': {'claim': claim}})}\n\n"
             
+            # ─── TASK 1: Re-chunk evidence for this specific claim ───
+            claim_evidence = []
+            for e in ev:
+                full = e.get("full_text", e.get("extracted_text", ""))
+                chunked = extract_relevant_chunk(full, claim)
+                claim_evidence.append({
+                    **e,
+                    "extracted_text": chunked
+                })
+
             t0_nli = time.time()
-            status_label, score, root_cause, best_text, agreement_score, sources_checked = compute_nli_status(claim, ev)
+            status_label, score, root_cause, best_text, agreement_score, sources_checked = compute_nli_status(claim, claim_evidence)
             nli_time_total += (time.time() - t0_nli)
             
             if root_cause:
@@ -379,8 +556,8 @@ async def analyze(request: AnalyzeRequest):
                 
             sources = []
 
-            if ev:
-                for e in ev[:3]:
+            if claim_evidence:
+                for e in claim_evidence[:3]:
                     text = e.get("extracted_text", "")
 
                     if len(text) > 150:
@@ -398,7 +575,7 @@ async def analyze(request: AnalyzeRequest):
                 "confidence": round(score, 2),
                 "agreement_score": round(agreement_score, 2),
                 "sources_checked": sources_checked,
-                "evidence": ev,
+                "evidence": claim_evidence,
                 "sources": sources
             }
             nli_results.append(nli_result)
@@ -409,7 +586,7 @@ async def analyze(request: AnalyzeRequest):
             elif status_label == "neutral":
                 nli_node_status = "warning"
                 
-            add_node(nli_id, "nli", {"claim": claim, "evidence": ev}, nli_result, f"NLI Verification {idx+1}", status=nli_node_status, score=round(score, 2))
+            add_node(nli_id, "nli", {"claim": claim, "evidence": claim_evidence}, nli_result, f"NLI Verification {idx+1}", status=nli_node_status, score=round(score, 2))
             add_edge(evidence_id, nli_id)
             nli_node_ids.append(nli_id)
             yield f"data: {json.dumps({'step': 'nli_done', 'status': nli_node_status, 'data': nli_result})}\n\n"
@@ -422,7 +599,8 @@ async def analyze(request: AnalyzeRequest):
                 
         hallucination_score_distribution = distribution.get("llm_hallucination", 0.0)
         correction = None
-        
+
+        # ─── TASK 2: Weighted Reliability Scoring ────────────────────
         if total_claims > 0:
             entailment_count = sum(1 for r in nli_results if r["status"] == "entailment")
             retrieval_failure_count = sum(1 for r in nli_results if r["root_cause"] == "retrieval_failure")
@@ -433,8 +611,17 @@ async def analyze(request: AnalyzeRequest):
             grounding = (total_claims - retrieval_failure_count) / total_claims
             hallucination = contradiction_count / total_claims
             
-            raw_reliability = (entailment_count - contradiction_count) / total_claims
-            reliability_score = max(0.0, raw_reliability)
+            # Weighted reliability score using NLI confidence
+            weighted_sum = 0.0
+            for r in nli_results:
+                if r["status"] == "entailment":
+                    weighted_sum += r["confidence"]
+                elif r["status"] == "contradiction":
+                    weighted_sum -= r["confidence"]
+                else:  # neutral — benefit of the doubt
+                    weighted_sum += 0.3
+
+            reliability_score = max(0.0, min(1.0, weighted_sum / total_claims))
         else:
             faithfulness = 0.0
             grounding = 0.0
@@ -445,21 +632,29 @@ async def analyze(request: AnalyzeRequest):
             contradiction_count = 0
             entailment_count = 0
 
-        if contradiction_count > 0:
-            summary = "Hallucination Detected"
-        elif total_claims > 0 and entailment_count > total_claims / 2:
+        # Nuanced summary thresholds
+        if reliability_score >= 0.75 and contradiction_count == 0:
             summary = "Reliable"
+        elif contradiction_count > 0 and contradiction_count >= total_claims * 0.5:
+            summary = "Hallucination Detected"
+        elif contradiction_count > 0:
+            summary = "Partially Unreliable"
         else:
             summary = "Low Confidence (Insufficient Evidence)"
-            
-        if contradiction_count > 0:
-            explanation = "Some claims contradict verified sources."
+
+        # Nuanced explanation
+        if contradiction_count > 0 and contradiction_count >= total_claims * 0.5:
+            explanation = f"{contradiction_count} of {total_claims} claims contradict verified sources. Major reliability concerns."
+        elif contradiction_count > 0:
+            explanation = f"{contradiction_count} of {total_claims} claims contradict sources, but most claims are supported."
+        elif entailment_count == total_claims:
+            explanation = "All claims are well-supported by reliable sources."
+        elif entailment_count > 0:
+            explanation = f"{entailment_count} of {total_claims} claims verified. Some claims lack sufficient evidence."
         elif retrieval_failure_count > 0:
             explanation = "Relevant sources were not found for some claims."
-        elif total_claims > 0 and entailment_count <= total_claims / 2:
-            explanation = "Low confidence due to insufficient reliable sources."
         else:
-            explanation = "The response is well-supported by reliable sources."
+            explanation = "Low confidence due to insufficient reliable sources."
 
         scoring = {
             "reliability_score": round(reliability_score, 2),
@@ -470,10 +665,11 @@ async def analyze(request: AnalyzeRequest):
             "explanation": explanation
         }
         
+        # Better status thresholds
         scoring_status = "success"
-        if reliability_score < 0.5:
+        if reliability_score < 0.4:
             scoring_status = "failure"
-        elif reliability_score < 0.8:
+        elif reliability_score < 0.75:
             scoring_status = "warning"
             
         add_node("node_scoring", "scoring", nli_results, scoring, "Final Scoring", status=scoring_status, score=round(reliability_score, 2))
@@ -482,16 +678,18 @@ async def analyze(request: AnalyzeRequest):
             
         yield f"data: {json.dumps({'step': 'scoring_done', 'status': scoring_status, 'data': scoring})}\n\n"
 
+        # ─── TASK 3: Correction with dict return ─────────────────────
         unsupported_count_total = contradiction_count + neutral_count + retrieval_failure_count
         if unsupported_count_total > 0:
             yield f"data: {json.dumps({'step': 'correction_running', 'status': 'running', 'data': {}})}\n\n"
-            corrected_text = generate_corrected_response(request.query, verified_context)
-            improvement = not corrected_text.startswith("Error")
+            correction_result = generate_corrected_response(request.query, verified_context)
+            improvement = correction_result["success"]
             unsupported_claims_list = [r["claim"] for r in nli_results if r["status"] != "entailment"]
             correction = {
                 "original_response": request.response,
-                "corrected_response": corrected_text,
+                "corrected_response": correction_result["text"],
                 "improvement": improvement,
+                "correction_source": correction_result["source"],
                 "unsupported_claims": unsupported_claims_list
             }
             correction_status = "success" if improvement else "failure"
@@ -529,4 +727,4 @@ async def analyze(request: AnalyzeRequest):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    uvicorn.run(app, host=BACKEND_HOST, port=BACKEND_PORT)
