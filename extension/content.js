@@ -14,6 +14,40 @@ document.head.appendChild(themeStyle);
 let latestElement = null;
 let originalHTML = "";
 
+const LLM_CONFIGS = {
+    "chatgpt.com": {
+        assistantSelector: 'div[data-message-author-role="assistant"]',
+        contentSelector: '.markdown'
+    },
+    "claude.ai": {
+        assistantSelector: 'div[data-testid="message-container-assistant"]',
+        contentSelector: '.font-claude-message'
+    },
+    "gemini.google.com": {
+        assistantSelector: 'message-content',
+        contentSelector: '.message-content'
+    },
+    "perplexity.ai": {
+        assistantSelector: 'div.prose',
+        contentSelector: 'div.prose'
+    },
+    "deepseek.com": {
+        assistantSelector: '.ds-markdown--block',
+        contentSelector: '.ds-markdown--block'
+    }
+};
+
+function getActiveLLMConfig() {
+    const host = window.location.hostname;
+    for (const [domain, config] of Object.entries(LLM_CONFIGS)) {
+        if (host.includes(domain)) return config;
+    }
+    return {
+        assistantSelector: 'div[class*="assistant"], div[class*="model-response"], .prose',
+        contentSelector: '.markdown, .prose, [class*="content"]'
+    };
+}
+
 function injectGlobalAuditButton() {
     if (document.getElementById("fx-global-audit-btn")) return;
     const btn = document.createElement("div");
@@ -21,12 +55,24 @@ function injectGlobalAuditButton() {
     btn.style.cssText = "position: fixed; bottom: 30px; right: 30px; z-index: 2000000; display: flex; align-items: center; gap: 10px; padding: 12px 24px; background: #2563eb; border-radius: 14px; cursor: pointer; box-shadow: 0 8px 30px rgba(37, 99, 235, 0.5); transition: 0.3s;";
     btn.innerHTML = `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line></svg><span style="color: white; font-size: 14px; font-weight: 800; text-transform: uppercase; letter-spacing: 1.5px;">Audit</span>`;
     btn.onclick = () => {
-        const msgs = document.querySelectorAll('div[data-message-author-role="assistant"]');
+        const config = getActiveLLMConfig();
+        const msgs = document.querySelectorAll(config.assistantSelector);
         if (msgs.length > 0) {
             const last = msgs[msgs.length - 1];
-            latestElement = last.querySelector('.markdown') || last;
+            latestElement = last.querySelector(config.contentSelector) || last;
             originalHTML = latestElement.innerHTML;
             analyzeResponse(last.innerText.trim());
+        } else {
+            // Fallback: search for any assistant-like container if specific selector fails
+            const fallbackMsgs = document.querySelectorAll('.assistant, [class*="assistant"]');
+            if (fallbackMsgs.length > 0) {
+                const last = fallbackMsgs[fallbackMsgs.length - 1];
+                latestElement = last;
+                originalHTML = last.innerHTML;
+                analyzeResponse(last.innerText.trim());
+            } else {
+                alert("Fixion: No AI response detected on this page yet.");
+            }
         }
     };
     document.body.appendChild(btn);
