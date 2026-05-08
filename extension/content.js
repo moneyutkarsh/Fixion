@@ -8,6 +8,9 @@ themeStyle.textContent = `
     @keyframes fx-spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
     @keyframes fx-pulse-text { 0%, 100% { opacity: 0.6; } 50% { opacity: 1; } }
     @keyframes fx-fade-slide { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+    @keyframes fx-stage-in { from { opacity: 0; transform: translateX(-10px); } to { opacity: 1; transform: translateX(0); } }
+    .fx-stage-active { color: #2563eb !important; }
+    .fx-stage-done { color: #10b981 !important; }
 `;
 document.head.appendChild(themeStyle);
 
@@ -139,14 +142,16 @@ function updatePanel(data) {
             <div style="padding: 18px; background: rgba(6, 78, 59, 0.4); border: 1px solid rgba(16, 185, 129, 0.4); border-radius: 12px; margin-bottom: 12px;">
                 <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 14px;">
                     <div style="width: 20px; height: 20px; background: #10b981; border-radius: 6px; display: flex; align-items: center; justify-content: center;"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="3"><polyline points="20 6 9 17 4 12"></polyline></svg></div>
-                    <span style="font-size: 11px; font-weight: 900; color: #fff; text-transform: uppercase; letter-spacing: 1px;">Self-Healing Fix Available</span>
+                    <span style="font-size: 11px; font-weight: 900; color: #fff; text-transform: uppercase; letter-spacing: 1px;">Sovereign Correction</span>
                 </div>
                 <div style="display: flex; gap: 10px;">
                     <button id="fx-copy-fix" style="flex: 1; padding: 12px; background: #10b981; color: white; border: none; border-radius: 10px; font-weight: 800; font-size: 13px; cursor: pointer;">Copy Fix</button>
                     <button id="fx-auto-fix" style="flex: 1; padding: 12px; background: #2563eb; color: white; border: none; border-radius: 10px; font-weight: 800; font-size: 13px; cursor: pointer;">Auto-Fix View</button>
                 </div>
             </div>
-            <button id="fx-open-trace" style="width: 100%; padding: 14px; background: rgba(255,255,255,0.03); color: #60a5fa; border: 1px solid rgba(255,255,255,0.1); border-radius: 12px; font-weight: 800; font-size: 13px; cursor: pointer;">Open Auditor Trace</button>
+
+            <button id="fx-highlight-btn" style="width: 100%; padding: 14px; background: rgba(37, 99, 235, 0.1); color: #60a5fa; border: 1px solid rgba(37, 99, 235, 0.3); border-radius: 12px; font-weight: 800; font-size: 13px; cursor: pointer; margin-bottom: 12px;">Highlight Hallucinations</button>
+            <button id="fx-open-trace" style="width: 100%; padding: 14px; background: rgba(255,255,255,0.03); color: #94a3b8; border: 1px solid rgba(255,255,255,0.1); border-radius: 12px; font-weight: 800; font-size: 13px; cursor: pointer;">Open Auditor Trace</button>
         </div>
     `;
 
@@ -154,6 +159,32 @@ function updatePanel(data) {
         document.getElementById("fx-copy-fix").onclick = () => { navigator.clipboard.writeText(data.correction.corrected_response); alert("✓ Copied!"); };
         document.getElementById("fx-auto-fix").onclick = () => { if (latestElement) { latestElement.innerHTML = data.correction.corrected_response.replace(/\n/g, '<br>'); latestElement.style.color = "#10b981"; } };
     }
+
+    document.getElementById("fx-highlight-btn").onclick = () => {
+        if (!latestElement) return;
+        let html = originalHTML;
+        data.nli_results.forEach(res => {
+            const safeClaim = res.claim.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\s+/g, '\\s+');
+            try {
+                const regex = new RegExp(`(${safeClaim})`, 'gi');
+                if (res.status === 'contradiction') {
+                    // BRIGHT RED FOR HALLUCINATIONS
+                    html = html.replace(regex, `<span style="background: rgba(255, 0, 0, 0.3) !important; border-bottom: 3px solid #ff0000 !important; color: #ffffff !important; font-weight: 900 !important; text-shadow: 0 0 10px #ff0000; padding: 2px 4px; border-radius: 4px;">$1</span>`);
+                } else if (res.status === 'entailment') {
+                    // PROFESSIONAL GREEN FOR VERIFIED
+                    html = html.replace(regex, `<span style="border-bottom: 2px solid #10b981; color: #10b981; font-weight: 600;">$1</span>`);
+                }
+            } catch (e) { console.error("Highlight Error:", e); }
+        });
+        latestElement.innerHTML = html;
+        // Scroll the element into view if needed
+        latestElement.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    };
+
+    // AUTOMATIC HIGHLIGHTING: Trigger the red highlight instantly on completion
+    setTimeout(() => {
+        document.getElementById("fx-highlight-btn")?.click();
+    }, 500);
 }
 
 async function analyzeResponse(text) {
@@ -161,36 +192,53 @@ async function analyzeResponse(text) {
     panel.style.display = "flex";
     const content = document.getElementById("fixion-ai-content");
     
-    const loadingSteps = [
-        "Initializing Sovereign Audit...",
-        "Extracting Neural Atomic Claims...",
-        "Searching Verified Knowledge Bases...",
-        "Verifying Grounding via Bayesian Model...",
-        "Analyzing Semantic Contradictions...",
-        "Calculating Veracity Index...",
-        "Finalizing Forensic Report..."
+    const stages = [
+        { id: "claims", label: "Extracting Atomic Claims", icon: "◈" },
+        { id: "retrieval", label: "Researching Evidence", icon: "◈" },
+        { id: "nli", label: "Forensic Verification", icon: "◈" },
+        { id: "scoring", label: "Generating Reliability Score", icon: "◈" }
     ];
     
-    let step = 0;
     content.innerHTML = `
-        <div id="fx-loading-stream" style="flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 40px; text-align: center;">
-            <div style="width: 48px; height: 48px; border: 4px solid rgba(37, 99, 235, 0.1); border-top-color: #2563eb; border-radius: 50%; animation: fx-spin 1s linear infinite; margin-bottom: 24px; box-shadow: 0 0 20px rgba(37, 99, 235, 0.2);"></div>
-            <div id="fx-loading-text" style="color: #60a5fa; font-size: 14px; font-weight: 800; text-transform: uppercase; letter-spacing: 1px; animation: fx-pulse-text 1.5s infinite;">Initializing Sovereign Audit...</div>
-            <div style="margin-top: 12px; color: #4b5563; font-size: 10px; font-weight: 600;">Neural Forensic Engine v15.0</div>
+        <div id="fx-loader-container" style="padding: 10px; animation: fx-fade-slide 0.4s ease-out;">
+            <div style="margin-bottom: 30px; text-align: center;">
+                <div style="width: 40px; height: 40px; border: 3px solid rgba(37, 99, 235, 0.1); border-top-color: #2563eb; border-radius: 50%; animation: fx-spin 0.8s linear infinite; margin: 0 auto 16px;"></div>
+                <div style="font-size: 11px; font-weight: 900; color: #60a5fa; text-transform: uppercase; letter-spacing: 2px;">Audit in Progress</div>
+            </div>
+            <div id="fx-stages-list" style="display: flex; flex-direction: column; gap: 20px;">
+                ${stages.map((s, i) => `
+                    <div id="stage-${s.id}" style="display: flex; align-items: center; gap: 15px; opacity: 0.3; transition: 0.4s; animation: fx-stage-in ${0.2 + i * 0.1}s ease-out forwards;">
+                        <div class="stage-icon" style="width: 24px; height: 24px; border-radius: 6px; background: rgba(255,255,255,0.05); display: flex; align-items: center; justify-content: center; font-size: 12px; font-weight: bold; border: 1px solid rgba(255,255,255,0.1);">${s.icon}</div>
+                        <div style="font-size: 13px; font-weight: 700; color: #94a3b8;">${s.label}</div>
+                    </div>
+                `).join('')}
+            </div>
         </div>
     `;
 
-    const stepInterval = setInterval(() => {
-        step = (step + 1) % loadingSteps.length;
-        const textEl = document.getElementById("fx-loading-text");
-        if (textEl) {
-            textEl.style.opacity = "0";
-            setTimeout(() => {
-                textEl.innerText = loadingSteps[step];
-                textEl.style.opacity = "1";
-            }, 200);
+    function updateStage(id, status) {
+        const el = document.getElementById(`stage-${id}`);
+        if (!el) return;
+        const icon = el.querySelector(".stage-icon");
+        if (status === "active") {
+            el.style.opacity = "1";
+            el.style.transform = "scale(1.02)";
+            icon.style.background = "rgba(37, 99, 235, 0.1)";
+            icon.style.borderColor = "#2563eb";
+            icon.style.color = "#2563eb";
+            icon.innerHTML = `<div style="width: 8px; height: 8px; background: #2563eb; border-radius: 50%; animation: fx-pulse-text 1s infinite;"></div>`;
+        } else if (status === "done") {
+            el.style.opacity = "1";
+            el.style.transform = "scale(1)";
+            icon.style.background = "rgba(16, 185, 129, 0.1)";
+            icon.style.borderColor = "#10b981";
+            icon.style.color = "#10b981";
+            icon.innerHTML = "✓";
         }
-    }, 1800);
+    }
+
+    // Initial state
+    updateStage("claims", "active");
 
     try {
         chrome.runtime.sendMessage({ type: "API_CALL", url: "http://127.0.0.1:8000/analyze", method: "POST", body: { query: "unknown", response: text, demo_mode: false }, isStreaming: true });
@@ -200,15 +248,29 @@ async function analyzeResponse(text) {
         if (msg.type === "STREAM_CHUNK") {
             try {
                 const event = JSON.parse(msg.chunk.substring(6));
+                if (event.step === "claims_extracted") { updateStage("claims", "done"); updateStage("retrieval", "active"); }
+                if (event.step === "retrieval_done") { updateStage("retrieval", "done"); updateStage("nli", "active"); }
+                if (event.step === "nli_done") { updateStage("nli", "done"); updateStage("scoring", "active"); }
+                if (event.step === "scoring_done") { updateStage("scoring", "done"); }
+                
                 if (event.step === "final") { 
-                    clearInterval(stepInterval);
                     updatePanel(event.data); 
                     chrome.runtime.onMessage.removeListener(listener); 
                 }
             } catch (e) {}
         }
     };
-    chrome.runtime.onMessage.addListener(listener);
+
+    try {
+        if (chrome.runtime && chrome.runtime.id) {
+            chrome.runtime.onMessage.addListener(listener);
+        } else {
+            throw new Error("Extension context invalidated");
+        }
+    } catch (e) { 
+        console.warn("Fixion: Connection to backend lost. Please refresh the page.");
+        content.innerHTML = `<div style="padding: 20px; text-align: center; color: #f43f5e; font-weight: bold;">Connection Lost.<br><span style="font-size: 11px; font-weight: normal; color: #94a3b8;">Please refresh the page to continue auditing.</span></div>`;
+    }
 }
 
 createOverlayPanel();

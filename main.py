@@ -11,6 +11,9 @@ import time
 import logging
 import os
 from dotenv import load_dotenv
+import asyncio
+from sentence_transformers import SentenceTransformer, util
+import torch
 
 load_dotenv()
 
@@ -38,6 +41,25 @@ if GEMINI_API_KEY and GEMINI_API_KEY != "YOUR_API_KEY_HERE":
         GEMINI_API_KEY = None
 else:
     logger.info("Local AI Engine Active (No Gemini Key found)")
+
+# Global caches and models for Phase 4
+evidence_cache = {}
+embedding_cache = {}
+
+# Production-grade device detection
+device = "cuda" if torch.cuda.is_available() else "cpu"
+logger.info(f"[INIT] Loading Semantic Embedder (MiniLM-L6) on {device}...")
+embedder = SentenceTransformer('all-MiniLM-L6-v2', device=device)
+
+# Initialize Groq client for global use
+client = None
+if GROQ_API_KEY and GROQ_API_KEY not in ["YOUR_GROQ_API_KEY", "YOUR_GROQ_KEY_HERE", ""]:
+    try:
+        from groq import Groq
+        client = Groq(api_key=GROQ_API_KEY)
+        logger.info("Groq Cloud Engine Active")
+    except Exception as e:
+        logger.error(f"Groq Init Failed: {e}")
 
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -100,6 +122,11 @@ def extract_claims(text: str):
     return cleaned_sentences
 
 def get_evidence(claim: str):
+    # STEP 6 & 7: Check Cache FIRST
+    if claim in evidence_cache:
+        logger.info(f"[CACHE] Using cached evidence for: {claim[:30]}...")
+        return evidence_cache[claim]
+
     # Simple web search using duckduckgo_search
     try:
         with DDGS() as ddgs:
@@ -147,15 +174,64 @@ def get_evidence(claim: str):
                 if downloaded:
                     text = extract(downloaded)
                     if text:
+                        # INCREASED WINDOW: Keep more text for semantic selector to find best parts
                         evidence_list.append({
                             "title": title,
                             "url": url,
-                            "extracted_text": text[:500]
+                            "extracted_text": text[:2500] 
                         })
             except:
                 pass
 
+    # STEP 8: Save Results To Cache
+    evidence_cache[claim] = evidence_list
     return evidence_list
+
+async def async_get_evidence(claim):
+    # This allows multiple searches simultaneously
+    return await asyncio.to_thread(get_evidence, claim)
+
+def get_semantic_chunks(text, claim, top_k=2):
+    """
+    Precisely extracts the most relevant segments from a large block of text.
+    Uses overlapping windows for better context.
+    """
+    if not text or len(text) < 150: return text
+    
+    # Split by sentences but filter for quality
+    sentences = [s.strip() for s in re.split(r'(?<=[.!?]) +', text) if len(s.strip()) > 10]
+    if len(sentences) < 3: return text
+    
+    # Create overlapping windows of 3 sentences each
+    chunks = []
+    for i in range(0, len(sentences) - 2, 1):
+        chunks.append(" ".join(sentences[i:i+3]))
+    
+    if not chunks: return text[:500]
+
+    try:
+        # Encode claim with cache
+        if claim in embedding_cache:
+            claim_emb = embedding_cache[claim]
+        else:
+            claim_emb = embedder.encode(claim, convert_to_tensor=True, device=device)
+            embedding_cache[claim] = claim_emb
+            
+        # Encode chunks in batch for speed
+        chunk_embs = embedder.encode(chunks, convert_to_tensor=True, device=device)
+        
+        # Calculate semantic similarity
+        cos_scores = util.cos_sim(claim_emb, chunk_embs)[0]
+        
+        # Select Top-K most relevant chunks
+        top_k = min(top_k, len(chunks))
+        top_results = torch.topk(cos_scores, k=top_k)
+        
+        best_chunks = [chunks[idx] for idx in top_results.indices]
+        return " ... ".join(best_chunks)
+    except Exception as e:
+        logger.error(f"[SEMANTIC] Selection error: {e}")
+        return text[:600] # Safe fallback
 
 def compute_nli_status(claim: str, evidence_list: list):
     if not evidence_list:
@@ -177,8 +253,12 @@ def compute_nli_status(claim: str, evidence_list: list):
     }
 
     for text in top_texts:
+        # PHASE 4: Semantic Chunk Retrieval
+        # Find the most relevant portion of the evidence text for this specific claim
+        relevant_context = get_semantic_chunks(text, claim)
+        
         result = nli_pipeline(
-            f"{text} [SEP] {claim}"
+            f"{relevant_context} [SEP] {claim}"
         )
         
         print("NLI RESULT:", result)  
@@ -310,11 +390,9 @@ def generate_corrected_response(query: str, nli_results: list, original_response
             
     # 2. Try Groq Fallback (High-Throughput Model)
     error_msg = "Unknown Error"
-    if GROQ_API_KEY and GROQ_API_KEY != "YOUR_GROQ_KEY_HERE":
+    if client:
         try:
             logger.info("Switching to Groq 8B for High-Throughput...")
-            from groq import Groq
-            client = Groq(api_key=GROQ_API_KEY)
             # Use 3.1 Instant model (Llama 3 8B is decommissioned)
             chat_completion = client.chat.completions.create(
                 messages=[{"role": "user", "content": prompt}],
@@ -350,19 +428,19 @@ class AnalyzeRequest(BaseModel):
 
 @app.post("/analyze")
 async def analyze(request: AnalyzeRequest):
-    def event_stream():
+    async def event_stream():
         start_time = time.time()
         
         if request.demo_mode:
             # Consistent, fast mock data for demo
             yield f"data: {json.dumps({'step': 'query_received', 'status': 'success', 'data': {'query': request.query}})}\n\n"
-            time.sleep(0.5)
+            await asyncio.sleep(0.5)
             yield f"data: {json.dumps({'step': 'claims_extracted', 'status': 'success', 'data': {}})}\n\n"
-            time.sleep(0.5)
+            await asyncio.sleep(0.5)
             yield f"data: {json.dumps({'step': 'retrieval_done', 'status': 'success', 'data': {}})}\n\n"
-            time.sleep(0.5)
+            await asyncio.sleep(0.5)
             yield f"data: {json.dumps({'step': 'nli_done', 'status': 'failure', 'data': {}})}\n\n"
-            time.sleep(0.5)
+            await asyncio.sleep(0.5)
             
             scoring = {
                 "reliability_score": 0.45,
@@ -370,7 +448,7 @@ async def analyze(request: AnalyzeRequest):
                 "summary": "Low reliability. Hallucinated claims detected."
             }
             yield f"data: {json.dumps({'step': 'scoring_done', 'status': 'failure', 'data': scoring})}\n\n"
-            time.sleep(0.5)
+            await asyncio.sleep(0.5)
             
             correction = {
                 "original_response": request.response,
@@ -428,19 +506,11 @@ async def analyze(request: AnalyzeRequest):
         
         yield f"data: {json.dumps({'step': 'claims_extracted', 'status': 'success', 'data': {'claims': claims}})}\n\n"
         
-        # Parallel Evidence Retrieval for speed
-        with ThreadPoolExecutor(max_workers=5) as executor:
-            future_to_claim = {executor.submit(get_evidence, claim): (idx, claim) for idx, claim in enumerate(claims)}
-            
-            evidence_map = {}
-            for future in future_to_claim:
-                idx, claim = future_to_claim[future]
-                try:
-                    ev = future.result()
-                    evidence_map[idx] = ev
-                except Exception as e:
-                    logger.error(f"Retrieval error for claim {idx}: {e}")
-                    evidence_map[idx] = []
+        # STEP 4: Replace Sequential/Threadpool with Asyncio.Gather
+        retrieval_tasks = [async_get_evidence(claim) for claim in claims]
+        all_evidence = await asyncio.gather(*retrieval_tasks)
+        
+        evidence_map = {idx: ev for idx, ev in enumerate(all_evidence)}
 
         nli_results = []
         cause_counts = {}
