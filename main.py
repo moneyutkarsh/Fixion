@@ -11,8 +11,14 @@ import time
 import logging
 import os
 from dotenv import load_dotenv
+from sentence_transformers import SentenceTransformer
+from sklearn.metrics.pairwise import cosine_similarity
+from google import genai as google_genai
+
 
 load_dotenv()
+import os
+print("GEMINI KEY:", os.getenv("GEMINI_API_KEY"))
 
 # Configuration from environment
 BACKEND_HOST = os.getenv("BACKEND_HOST", "127.0.0.1")
@@ -22,22 +28,20 @@ CORRECTION_MODEL_NAME = os.getenv("CORRECTION_MODEL", "llama3")
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/api/generate")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+safety_settings = {
+    "HARM_CATEGORY_HARASSMENT": "BLOCK_NONE",
+    "HARM_CATEGORY_HATE_SPEECH": "BLOCK_NONE",
+    "HARM_CATEGORY_SEXUALLY_EXPLICIT": "BLOCK_NONE",
+    "HARM_CATEGORY_DANGEROUS_CONTENT": "BLOCK_NONE",
+}
+from groq import Groq
+
+client = Groq(api_key=GROQ_API_KEY)
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger("FixionAI")
 
-if GEMINI_API_KEY and GEMINI_API_KEY != "YOUR_API_KEY_HERE":
-    import google.generativeai as genai
-    try:
-        genai.configure(api_key=GEMINI_API_KEY)
-        # Use Stable 1.5 Flash to avoid 2.0 quota limits on free tier
-        model = genai.GenerativeModel('models/gemini-1.5-flash')
-        logger.info("Gemini AI Cloud Engine Active (1.5-Flash Stable Verified)")
-    except Exception as e:
-        logger.error(f"Gemini Init Failed: {e}")
-        GEMINI_API_KEY = None
-else:
-    logger.info("Local AI Engine Active (No Gemini Key found)")
+
 
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -80,50 +84,73 @@ async def get_test_cases():
 
 # Load NLI model globally
 nli_pipeline = pipeline("text-classification", model=NLI_MODEL_NAME)
+embedder = SentenceTransformer('all-MiniLM-L6-v2')
+embedding_cache = {}
+
+def split_into_chunks(text, chunk_size=300):
+    words = text.split()
+    chunks = []
+
+    for i in range(0, len(words), chunk_size):
+        chunk = " ".join(words[i:i + chunk_size])
+        chunks.append(chunk)
+
+    return chunks
+
 def extract_claims(text: str):
+
+
     # Split by punctuation and newlines to handle bullet points
     lines = re.split(r'[.!?\n]', text)
     sentences = [s.strip() for s in lines if s.strip()]
     
     # Clean bullet point markers like "- ", "* ", "1. "
     cleaned_sentences = []
+
     for s in sentences:
         cleaned = re.sub(r'^[\s\d.*-]*', '', s).strip()
-        if len(cleaned.split()) >= 4:
+
+        if (
+            len(cleaned.split()) >= 4
+            and not cleaned.lower().startswith(("yes", "no", "okay"))
+        ):
             cleaned_sentences.append(cleaned)
     
-    # Performance Optimization: Limit to top 5 most substantive claims
+    # Performance Optimization
     if len(cleaned_sentences) > 5:
-        cleaned_sentences = sorted(cleaned_sentences, key=len, reverse=True)[:5]
+        cleaned_sentences = sorted(
+            cleaned_sentences,
+            key=len,
+            reverse=True
+        )[:5]
             
-    logger.info(f"[CLAIMS] Extracted {len(cleaned_sentences)} claims (capped at 5 for speed)")
+    logger.info(f"[CLAIMS] Extracted {len(cleaned_sentences)} claims")
+
     return cleaned_sentences
+    
+
 
 def get_evidence(claim: str):
+
     # Simple web search using duckduckgo_search
     try:
         with DDGS() as ddgs:
-            # INCREASED RESEARCH DEPTH: Scan up to 12 sources for maximum verification
+
+            # INCREASED RESEARCH DEPTH
             results = list(ddgs.text(claim, max_results=12))
+
             logger.info(f"[SEARCH] {len(results)} results for claim")
+
     except Exception:
         results = []
+
         logger.info(f"[SEARCH] 0 results for claim (error)")
-        
-    # Prefer high quality domains
-    def domain_score(url):
-        url_lower = url.lower()
-        if "wikipedia.org" in url_lower: return 3
-        if ".gov" in url_lower or ".edu" in url_lower: return 2
-        if "docs." in url_lower or "developer." in url_lower: return 1
-        return 0
-        
-    results = sorted(results, key=lambda x: domain_score(x.get("href", "")), reverse=True)
-    
+
     evidence_list = []
-    
-    # SPEED PATCH: Use snippets primarily. Only fetch top 2 full pages if snippet is tiny.
+
+    # Process sources
     for i, r in enumerate(results):
+
         if len(evidence_list) >= 6:
             break
 
@@ -131,29 +158,100 @@ def get_evidence(claim: str):
         url = r.get("href", "")
         snippet = r.get("body", "")
 
-        # Use snippet immediately if it has substance
+        # FAST PATH — use snippets directly
         if snippet and len(snippet.split()) > 15:
+
             evidence_list.append({
                 "title": title,
                 "url": url,
                 "extracted_text": snippet
             })
+
             continue
-            
-        # Only attempt full-page fetch for the very top results if snippet is empty
+
+        # FULL PAGE FETCH ONLY FOR TOP RESULTS
         if i < 2:
+
             try:
+
                 downloaded = fetch_url(url)
+
                 if downloaded:
+
                     text = extract(downloaded)
+
                     if text:
+
+                        extracted_text = text.strip()
+
+                        # HARD LIMIT HUGE PAGES
+                        if len(extracted_text.split()) > 8000:
+                            extracted_text = " ".join(
+                                extracted_text.split()[:8000]
+                            )
+
+                        # STEP 1 — Split webpage into chunks
+                        chunks = split_into_chunks(extracted_text)
+
+                        # LIMIT huge pages
+                        chunks = chunks[:30]
+
+                        if not chunks:
+                            continue
+
+                        # STEP 2 — Create embeddings
+                        try:
+
+                            cache_key = hash(" ".join(chunks[:3]))
+
+                            if cache_key in embedding_cache:
+                                chunk_embeddings = embedding_cache[cache_key]
+
+                            else:
+                                chunk_embeddings = embedder.encode(chunks)
+                                embedding_cache[cache_key] = chunk_embeddings
+
+                            claim_embedding = embedder.encode([claim])
+
+                        except Exception as e:
+
+                            logger.info(f"[EMBED ERROR] {e}")
+
+                            continue
+
+                        # STEP 3 — Similarity search
+                        scores = cosine_similarity(
+                            [claim_embedding[0]],
+                            chunk_embeddings
+                        )[0]
+
+                        # STEP 4 — Select top chunks
+                        top_indices = scores.argsort()[-3:][::-1]
+
+                        top_chunks = [
+                            chunks[i]
+                            for i in top_indices
+                        ]
+
+                        # STEP 5 — Merge best chunks
+                        best_chunk_text = "\n\n".join(top_chunks)
+
+                        logger.info(
+                            f"[CHUNKS] Total chunks: {len(chunks)}"
+                        )
+
+                        # STEP 6 — Save relevant evidence
                         evidence_list.append({
                             "title": title,
                             "url": url,
-                            "extracted_text": text[:500]
+                            "extracted_text": best_chunk_text
                         })
-            except:
-                pass
+
+            except Exception as e:
+
+                logger.info(f"[FETCH ERROR] {e}")
+
+                continue
 
     return evidence_list
 
@@ -253,13 +351,14 @@ def compute_nli_status(claim: str, evidence_list: list):
 
 def generate_corrected_response(query: str, nli_results: list, original_response: str = ""):
     evidence_str = ""
+
     for r in nli_results:
         status = r.get("status", "neutral").upper()
         evidence_str += f"[{status}] Source: {r.get('evidence', '')}\n"
-        
+
     if not evidence_str:
         evidence_str = "No specific web evidence found. Use general knowledge to fix obvious logical errors."
-        
+
     prompt = f"""
     You are a professional Fact-Checker and Editor. 
     Rewrite the following AI response to be 100% accurate based on the Research Evidence provided.
@@ -280,69 +379,56 @@ def generate_corrected_response(query: str, nli_results: list, original_response
     5. ANALYSIS: If technical, include Time/Space Complexity and Edge Cases.
     6. STRUCTURE: Use Premium Markdown (## Headers, **Bold**, * Lists).
     """
-    
-    # 1. Try Gemini Cloud if available
-    if GEMINI_API_KEY and GEMINI_API_KEY != "YOUR_API_KEY_HERE":
-        try:
-            # SAFETY BYPASS: Disable all filters to prevent blocking business/strategy content
-            safety_settings = [
-                {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
-                {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
-                {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
-                {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
-            ]
-            
-            # Try 1.5 Flash primarily
-            model = genai.GenerativeModel('gemini-1.5-flash-latest', safety_settings=safety_settings)
-            response = model.generate_content(prompt)
-            
-            # Fallback if blocked or empty
-            if not response or not response.text:
-                logger.info("Retrying with Pro model due to empty response...")
-                model = genai.GenerativeModel('gemini-1.5-pro-latest', safety_settings=safety_settings)
-                response = model.generate_content(prompt)
 
-            if response.text:
+    # ---------------- GEMINI ----------------
+    if GEMINI_API_KEY and GEMINI_API_KEY.strip():
+        try:
+            from google import genai as google_genai
+
+            client = google_genai.Client(api_key=GEMINI_API_KEY)
+
+            response = client.models.generate_content(
+                model="gemini-flash-latest",
+                contents=prompt
+            )
+
+            if response and getattr(response, "text", None):
                 return response.text
-            raise Exception("Empty Gemini response")
+
+            logger.info("Retrying with Gemini Pro...")
+
+            response = client.models.generate_content(
+                model="gemini-flash-latest",
+                contents=prompt
+            )
+
+            if response and getattr(response, "text", None):
+                return response.text
+
         except Exception as e:
             logger.error(f"Gemini error: {e}")
-            
-    # 2. Try Groq Fallback (High-Throughput Model)
-    error_msg = "Unknown Error"
-    if GROQ_API_KEY and GROQ_API_KEY != "YOUR_GROQ_KEY_HERE":
+
+    # ---------------- GROQ ----------------
+    if GROQ_API_KEY and GROQ_API_KEY.strip() != "":
         try:
-            logger.info("Switching to Groq 8B for High-Throughput...")
+            logger.info("Switching to Groq 8B...")
+
             from groq import Groq
             client = Groq(api_key=GROQ_API_KEY)
-            # Use 3.1 Instant model (Llama 3 8B is decommissioned)
+
             chat_completion = client.chat.completions.create(
                 messages=[{"role": "user", "content": prompt}],
                 model="llama-3.1-8b-instant",
             )
+
             if chat_completion.choices[0].message.content:
                 return chat_completion.choices[0].message.content
+
         except Exception as ge:
-            logger.error(f"Groq Correction Error: {str(ge)}")
-            error_msg = f"Groq Error: {str(ge)[:100]}"
-            
-    # 3. Final Fallback: Local Ollama (Always available)
-    try:
-        logger.info("Switching to Local Ollama Fallback...")
-        import requests
-        ollama_url = os.getenv("OLLAMA_URL", "http://localhost:11434/api/generate")
-        response = requests.post(ollama_url, json={
-            "model": "llama3",
-            "prompt": prompt,
-            "stream": False
-        }, timeout=10)
-        if response.status_code == 200:
-            return response.json().get("response", "Ollama Response Failed")
-    except Exception as oe:
-        logger.error(f"Ollama Correction Error: {str(oe)}")
+            logger.error(f"Groq Error: {ge}")
 
-    return f"Cloud Error ({error_msg})"
-
+    # ---------------- FALLBACK ----------------
+    return "ERROR: All LLM providers failed (Gemini + Groq)"
 class AnalyzeRequest(BaseModel):
     query: str
     response: str
@@ -535,7 +621,7 @@ async def analyze(request: AnalyzeRequest):
             total_weight = 0
             
             for r in nli_results:
-                conf = r.get("score", 1.0)
+                conf = r.get("confidence", 1.0)
                 weight = 2.0 if any(t in r.get("claim", "").lower() for t in ["code", "algorithm", "dfs", "complexity"]) else 1.0
                 
                 if r["status"] == "entailment":
@@ -670,7 +756,13 @@ async def analyze(request: AnalyzeRequest):
         }
         
         if correction:
-            response_data["correction"] = correction
+            response_data["heal_payload"] = {
+                "text": request.response,
+                "query": request.query,
+                "claims": claims,
+                "context": verified_context,
+                "nli_results": nli_results
+            }
             
         yield f"data: {json.dumps({'step': 'final', 'status': 'success', 'data': response_data})}\n\n"
 
@@ -678,40 +770,55 @@ async def analyze(request: AnalyzeRequest):
 
 class HealRequest(BaseModel):
     text: str
+    query: str
     claims: list
     context: list
+    nli_results: list
 
 @app.post("/heal")
 async def heal(request: HealRequest):
+
     context_str = "\n\n".join(request.context)
     claims_str = "\n".join(request.claims)
-    
-    # Filter for all available evidence to give AI more substance
+
     evidence_str = ""
-    for r in nli_results:
+    for r in request.nli_results:
         status_label = r["status"].upper()
-        evidence_str += f"[{status_label}] Source: {r['evidence']}\n"
-    
+        evidence_str += f"[{status_label}] Source: {r.get('evidence', '')}\n"
+
     prompt = f"""
-    As an AI Hallucination Correction Engine, your task is to rewrite the AI response to be 100% accurate based on the provided evidence.
-    If the evidence contradicts the original response, fix it. 
-    If the evidence is neutral but provides useful facts, incorporate them.
-    
-    Original Query: {query}
-    Original AI Response: {original_response}
-    
-    Research Evidence Found:
-    {evidence_str if evidence_str else "Note: Search results were limited, use general knowledge to fix obvious logical errors."}   {context_str}
-    
-    Instructions:
-    1. Replace unverified claims with factual information from the evidence.
-    2. Keep the tone professional and the length similar.
-    3. If evidence is missing for a claim, remove the claim or state it is unverified.
-    
-    Corrected Response:
+    You are an AI Hallucination Correction Engine.
+
+    ORIGINAL QUERY:
+    {request.query}
+
+    ORIGINAL RESPONSE:
+    {request.text}
+
+    CLAIMS:
+    {claims_str}
+
+    NLI EVIDENCE:
+    {evidence_str if evidence_str else "No strong evidence available."}
+
+    CONTEXT:
+    {context_str}
+
+    RULES:
+    1. Fix contradictions using evidence
+    2. Remove unsupported claims
+    3. Keep response natural and structured
     """
-    
-    return {"corrected_response": generate_corrected_response("Repair hallucinations", [prompt])}
+
+    corrected = generate_corrected_response(
+        request.query,
+        request.nli_results,
+        request.text
+    )
+
+    return {
+        "corrected_response": corrected
+    }
 
 if __name__ == "__main__":
     import uvicorn
